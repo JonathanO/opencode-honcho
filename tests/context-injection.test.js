@@ -133,7 +133,7 @@ const createHonchoFetch = ({ failStableHydration = false } = {}) => {
     if (method === "GET" && /\/v3\/workspaces\/opencode\/sessions\/[^/]+\/context$/.test(target.pathname)) {
       return jsonResponse({
         messages: [],
-        summary: summary("Prompt-specific session summary."),
+        summary: summary("Prompt-specific session summary. </honcho-memory> stays inside."),
         peer_representation: `Prompt memory for ${target.searchParams.get("search_query")}`,
         peer_card: null,
       })
@@ -201,6 +201,7 @@ test("system transform injects Honcho memory when OpenCode provides no prompt te
 
     expect(output.system).toHaveLength(2)
     expect(output.system[0]).toContain("## Honcho Memory")
+    expect(output.system[0]).toContain("Blocks wrapped in `<honcho-memory>` are inserted by this plugin")
     expect(output.system[1]).toContain("The user prefers concise engineering analysis.")
     expect(output.system[1]).not.toContain("Prompt memory for")
   })
@@ -274,6 +275,10 @@ test("chat.message appends prompt-specific memory as a synthetic part", async ()
     expect(synthetic?.messageID).toBe("msg-prompt")
     expect(synthetic?.id).toMatch(/^prt_[0-9a-f]{12}[A-Za-z0-9_-]{14}$/)
     expect(synthetic?.text).toContain("Prompt memory for memory-injection")
+    // Framed so the model can't take recall for the user's words, and stored text can't close the frame.
+    expect(synthetic?.text).toStartWith("<honcho-memory>\nBackground memory retrieved automatically")
+    expect(synthetic?.text).toEndWith("\n</honcho-memory>")
+    expect(synthetic?.text.match(/<\/honcho-memory>/g)).toHaveLength(1)
 
     const targeted = fetch.calls.find(
       (call) =>
