@@ -57,6 +57,19 @@ const nextGeneration = (location: string) => {
 }
 const isCurrentGeneration = (location: string, generation: number) => generations().get(location) === generation
 
+// Where the prompt hook saves a prompt's recall: the metadata OpenCode stores with the message.
+const RECALL_METADATA_KEY = "honchoRecall"
+const recallIn = (metadata: Record<string, unknown> | undefined) => {
+  const recall = metadata?.[RECALL_METADATA_KEY]
+  return typeof recall === "string" && recall ? recall : undefined
+}
+// OpenCode 2.3 gives the context hook each message's stored metadata (OpenCode #63590). A version
+// that is not a release number is taken to be a current build.
+const passesMessageMetadata = (version: string) => {
+  const [major, minor] = version.split(".").map(Number)
+  return !(major === 2 && minor < 3)
+}
+
 export const setup = async (ctx: PluginContext) => {
   const location = ctx.location.directory
   const generation = nextGeneration(location)
@@ -65,16 +78,25 @@ export const setup = async (ctx: PluginContext) => {
   const core = createHonchoCore(consoleHost(ctx.location.directory, ctx.location.project?.directory), configPath)
   core.setHostVersion(ctx.app.version)
 
-  // Prompt-specific recall per session. The v1 path appends it to the user message; on v2 the
-  // prompt hook's edits become the persisted user text, so it rides in the request context instead.
-  const pendingRecall = new Map<string, string>()
-
   const here = ctx.location.directory
   const sessionDirectories = new Map<string, string>()
   const ownsSession = (event: V2Event, sessionID: string) => {
     const published = eventLocationDirectory(event)
     if (published) sessionDirectories.set(sessionID, published)
     return (published ?? sessionDirectories.get(sessionID)) === here
+  }
+
+  const messageMetadata = passesMessageMetadata(ctx.app.version)
+  // Before OpenCode 2.3 the context hook gets no message metadata, so the recalls are read from the
+  // stored session. That is the latest compaction's view, which can miss prompts that a model switch
+  // brings back after a native compaction.
+  const storedRecalls = async (sessionID: string) => {
+    const recalls = new Map<string, string>()
+    for (const message of await ctx.session.context({ sessionID })) {
+      const recall = message.type === "user" ? recallIn(message.metadata) : undefined
+      if (recall) recalls.set(message.id, recall)
+    }
+    return recalls
   }
 
   await ctx.session.hook("prompt", async (event) => {
@@ -86,18 +108,33 @@ export const setup = async (ctx: PluginContext) => {
       text,
       timestampToIso(Date.now()),
       "session.prompt",
+      { skipUnchanged: false },
     )
-    if (block) pendingRecall.set(event.sessionID, block)
+    // Prompt-specific recall. The v1 path appends it to the user message; on v2 the prompt hook's
+    // edits to the text become what the user wrote, so the recall is saved in the prompt's metadata
+    // instead, and the context hook puts it back on every step.
+    if (block) event.metadata = { ...event.metadata, [RECALL_METADATA_KEY]: block }
     await core.log("debug", "Honcho captured user prompt.", { sessionId: event.sessionID, recall: Boolean(block) })
   })
 
   await ctx.session.hook("context", async (event) => {
     core.rememberSessionModel(event.sessionID, modelId(event.model))
-    const blocks = await core.systemBlocks({ sessionID: event.sessionID })
-    if (blocks.length === 0) return
-    for (const text of blocks) event.system.push({ type: "text", text })
-    const recall = pendingRecall.get(event.sessionID)
-    if (recall) event.messages.push({ role: "user", content: [{ type: "text", text: recall }] })
+    for (const text of await core.systemBlocks({ sessionID: event.sessionID })) event.system.push({ type: "text", text })
+    // Each recall goes right after the prompt it was retrieved for, read from that prompt's stored
+    // metadata. Being stored, it survives plugin reloads and server restarts, moves with a queued
+    // prompt, and goes away when a revert or compaction removes its prompt, so earlier history never
+    // changes between steps. Stored recalls are always shown: recallMode only decides whether new ones
+    // are fetched. A recall identical to the last one still shown is skipped.
+    const stored = messageMetadata ? undefined : await storedRecalls(event.sessionID)
+    let shown: string | undefined
+    for (let at = 0; at < event.messages.length; at++) {
+      const message = event.messages[at]
+      if (message?.role !== "user") continue
+      const recall = stored ? (message.id ? stored.get(message.id) : undefined) : recallIn(message.metadata)
+      if (!recall || recall === shown) continue
+      shown = recall
+      event.messages.splice(++at, 0, { role: "user", content: [{ type: "text", text: recall }] })
+    }
   })
 
   await ctx.session.hook("compaction", async (event) => {
@@ -180,7 +217,6 @@ export const setup = async (ctx: PluginContext) => {
         return
       }
       case "session.deleted": {
-        pendingRecall.delete(sessionID)
         await core.dropSessionState({ sessionID })
         return
       }

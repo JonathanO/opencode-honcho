@@ -202,7 +202,7 @@ One `./server` entry serves both OpenCode generations: 1.x calls its `server()` 
 | `honcho_*` tools | `tool` | `tool.transform` |
 | Session start, assistant capture, cleanup | `event` | `event.subscribe()` (`session.created`, `session.text.ended`, `session.step.ended`, `session.execution.*`, `session.deleted`) |
 
-On 2.x, prompt-specific recall rides in the request context instead of a synthetic message part, because 2.x persists prompt-hook edits as the user's message.
+On 2.x, prompt-specific recall is saved in the prompt's message metadata instead of a synthetic message part, because 2.x persists prompt-hook edits as the user's message. The `context` hook reads it back and inserts it right after its prompt on every step, so earlier history never changes, even across plugin reloads and server restarts, and provider prompt caches stay valid. On OpenCode 2.3 and later it reads each request message's stored metadata; older 2.x reads the stored session instead. Recall already shown stays when `recallMode` changes: the mode only decides whether new recall is fetched.
 
 ### How hooks drive memory
 

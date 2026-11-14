@@ -1487,12 +1487,14 @@ export const createHonchoCore = (host: HostAdapter, configPath?: string) => {
     }
 
     // Captures the user turn and returns the prompt-specific recall block when it changed,
-    // or null when recall is off, the prompt is trivial, or the block is unchanged.
+    // or null when recall is off, the prompt is trivial, or the block is unchanged. A host that
+    // drops repeats itself, from what the request still shows, passes skipUnchanged: false.
     const captureUserPrompt = (
       input: Record<string, unknown>,
       message: string,
       createdAt: string | undefined,
       source: string,
+      { skipUnchanged = true }: { skipUnchanged?: boolean } = {},
     ) =>
       withRuntime<string | null>(input, async (runtime) => {
         const state = getState(deriveSessionStateKey(runtime))
@@ -1512,7 +1514,7 @@ export const createHonchoCore = (host: HostAdapter, configPath?: string) => {
           return null
         }
         const block = await refreshPromptContext(runtime, state, message)
-        if (!block || block === state.lastInjectedContext) {
+        if (!block || (skipUnchanged && block === state.lastInjectedContext)) {
           return null
         }
         state.lastInjectedContext = block

@@ -37,6 +37,7 @@ const fakeContext = ({ directory = process.cwd(), subscribe } = {}) => {
     },
     session: {
       hook: hook(hooks.session),
+      context: async () => [],
     },
     shell: { hook: hook(hooks.shell) },
     tool: {
@@ -215,5 +216,115 @@ describe("OpenCode 2 event scoping", () => {
         else process.env[key] = saved[key]
       }
     }
+  })
+})
+
+describe("OpenCode 2 recall placement", () => {
+  // Honcho API stub: creates echo their id, and the session context carries a recall per search query.
+  const honchoFetch = async (url, init = {}) => {
+    const target = new URL(url)
+    if (/\/sessions\/[^/]+\/context$/.test(target.pathname))
+      return Response.json({ messages: [], summary: null, peer_representation: `Recall for ${target.searchParams.get("search_query")}`, peer_card: null })
+    if (target.pathname.endsWith("/messages")) return Response.json([])
+    const body = typeof init.body === "string" ? JSON.parse(init.body) : {}
+    return Response.json({ id: body.id, metadata: {}, configuration: {}, created_at: new Date(0).toISOString() })
+  }
+  const withHoncho = async (run, { recallMode = "hybrid" } = {}) => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "honcho-v2-"))
+    const configPath = path.join(home, "config.json")
+    await writeFile(configPath, JSON.stringify({ apiKey: "test-key", peerName: "wire", hosts: { opencode: { recallMode } } }))
+    const realFetch = globalThis.fetch
+    globalThis.fetch = honchoFetch
+    try {
+      const mod = await import("../dist/server.js")
+      // Each load is a fresh plugin instance, as after an OpenCode reload or restart.
+      const load = async (stored, { version = "2.0.16" } = {}) => {
+        const { ctx, hooks, find } = fakeContext({ directory: home })
+        ctx.options = { configPath }
+        ctx.app.version = version
+        ctx.session.context = async ({ sessionID }) => (sessionID === "ses_place" ? stored() : [])
+        const cleanup = await mod.default.setup(ctx)
+        return { cleanup, prompt: find(hooks.session, "prompt"), context: find(hooks.session, "context") }
+      }
+      await run({ load, recallKey: "honchoRecall" }) // stored with each message, so the key must not change
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  }
+
+  test("prompt hook saves the recall in the prompt's metadata", async () => {
+    await withHoncho(async ({ load, recallKey }) => {
+      const plugin = await load(() => [])
+      const event = { sessionID: "ses_place", messageID: "msg_1", prompt: { text: "fix memory injection" }, metadata: { client: "kept" }, delivery: "steer" }
+      await plugin.prompt(event)
+      expect(event.metadata).toEqual({ client: "kept", [recallKey]: expect.stringContaining("Recall for") })
+      expect(event.prompt.text).toBe("fix memory injection")
+      // An unchanged recall is still saved: if a revert or compaction removes the earlier prompt,
+      // this one has to carry it. The context hook drops the repeat while both are shown.
+      const again = { sessionID: "ses_place", messageID: "msg_2", prompt: { text: "fix memory injection" }, delivery: "steer" }
+      await plugin.prompt(again)
+      expect(again.metadata).toEqual({ [recallKey]: event.metadata[recallKey] })
+      await plugin.cleanup()
+    })
+  })
+
+  test("context hook puts each stored recall after its prompt, from any plugin instance", async () => {
+    await withHoncho(async ({ load, recallKey }) => {
+      const stored = (...messages) => messages.map(([id, type, recall]) => ({ id, type, ...(recall ? { metadata: { [recallKey]: recall } } : {}) }))
+      const message = (id, role) => ({ id, role, content: [{ type: "text", text: id }] })
+      const request = async (plugin, ...messages) => {
+        const event = { sessionID: "ses_place", model: { providerID: "anthropic", id: "claude" }, system: [], messages }
+        await plugin.context(event)
+        return event.messages.map((m) => m.id ?? m.content[0].text)
+      }
+
+      let history = stored(["msg_1", "user", "R1"], ["msg_a", "assistant"], ["msg_2", "user", "R2"], ["msg_3", "user", "R2"], ["msg_4", "user"])
+      const messages = [message("msg_1", "user"), message("msg_a", "assistant"), message("msg_2", "user"), message("msg_3", "user"), message("msg_4", "user")]
+      const expected = ["msg_1", "R1", "msg_a", "msg_2", "R2", "msg_3", "msg_4"] // msg_3's repeat of R2 is skipped
+      const first = await load(() => history)
+      expect(await request(first, ...messages)).toEqual(expected)
+      await first.cleanup()
+
+      // A reload or restart keeps nothing in memory, and the request comes out the same.
+      const second = await load(() => history)
+      expect(await request(second, ...messages)).toEqual(expected)
+
+      // Compaction or a revert removed msg_1 and msg_2: msg_3 now shows R2 itself.
+      history = stored(["msg_3", "user", "R2"], ["msg_4", "user"])
+      expect(await request(second, message("msg_3", "user"), message("msg_4", "user"))).toEqual(["msg_3", "R2", "msg_4"])
+      await second.cleanup()
+    })
+  })
+
+  // On OpenCode 2.3+ each request message carries its stored metadata.
+  const metadataMessage = (id, role, recall) => ({ id, role, content: [{ type: "text", text: id }], ...(recall ? { metadata: { honchoRecall: recall } } : {}) })
+  const requestOn = async (plugin, messages) => {
+    const event = { sessionID: "ses_place", model: { providerID: "anthropic", id: "claude" }, system: [], messages }
+    await plugin.context(event)
+    return event.messages.map((m) => m.id ?? m.content[0].text)
+  }
+
+  test("on OpenCode 2.3+ the recall comes from the request's own messages, not the stored session", async () => {
+    await withHoncho(async ({ load }) => {
+      // The stored session's latest view leaves out msg_0, as after a native compaction; a model
+      // switch can still bring msg_0 back into the request, and its recall has to come with it.
+      const plugin = await load(() => {
+        throw new Error("session.context is not needed on 2.3+")
+      }, { version: "2.3.0" })
+      const messages = [metadataMessage("msg_0", "user", "R0"), metadataMessage("msg_a", "assistant"), metadataMessage("msg_1", "user", "R1")]
+      expect(await requestOn(plugin, messages)).toEqual(["msg_0", "R0", "msg_a", "msg_1", "R1"])
+      await plugin.cleanup()
+    })
+  })
+
+  test("recalls already shown stay after recallMode changes to tools", async () => {
+    await withHoncho(
+      async ({ load }) => {
+        const plugin = await load(() => [], { version: "2.3.0" })
+        expect(await requestOn(plugin, [metadataMessage("msg_1", "user", "R1"), metadataMessage("msg_2", "user")])).toEqual(["msg_1", "R1", "msg_2"])
+        await plugin.cleanup()
+      },
+      { recallMode: "tools" },
+    )
   })
 })
