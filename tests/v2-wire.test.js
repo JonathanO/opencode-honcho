@@ -270,4 +270,40 @@ describe("OpenCode 2 recall placement", () => {
       globalThis.fetch = realFetch
     }
   })
+
+  test("recall survives a plugin reload for the same location", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "honcho-v2-"))
+    const configPath = path.join(home, "config.json")
+    await writeFile(configPath, JSON.stringify({ apiKey: "test-key", peerName: "wire", hosts: { opencode: { recallMode: "hybrid" } } }))
+    const realFetch = globalThis.fetch
+    globalThis.fetch = honchoFetch
+    try {
+      const mod = await import("../dist/server.js")
+      const load = async () => {
+        const { ctx, hooks, find } = fakeContext({ directory: home })
+        ctx.options = { configPath }
+        return { cleanup: await mod.default.setup(ctx), hooks, find }
+      }
+      const user = (id, text) => ({ id, role: "user", content: [{ type: "text", text }] })
+      const first = user("msg_1", "fix memory injection")
+      const request = async ({ hooks, find }, ...messages) => {
+        const event = { sessionID: "ses_reload", model: { providerID: "anthropic", id: "claude" }, system: [], messages }
+        await find(hooks.session, "context")(event)
+        return event.messages.map((message) => message.id ?? message.content[0].text)
+      }
+      const recall = expect.stringContaining("Recall for")
+
+      const before = await load()
+      await before.find(before.hooks.session, "prompt")({ sessionID: "ses_reload", messageID: first.id, prompt: { text: first.content[0].text } })
+      expect(await request(before, first)).toEqual(["msg_1", recall])
+      await before.cleanup()
+
+      // OpenCode reloads the location's plugins after it idles; the next request must look the same.
+      const after = await load()
+      expect(await request(after, first)).toEqual(["msg_1", recall])
+      await after.cleanup()
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
 })

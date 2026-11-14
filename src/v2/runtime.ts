@@ -57,6 +57,20 @@ const nextGeneration = (location: string) => {
 }
 const isCurrentGeneration = (location: string, generation: number) => generations().get(location) === generation
 
+// Recall blocks per location, session and prompt message ID. They live outside setup() because
+// OpenCode reloads a location's plugins when it reboots that location's services, which happens
+// after it sits idle. A reload must not drop the recalls already shown after earlier prompts:
+// that rewrites history and costs the prompt cache (claude-agent replays the whole conversation).
+type SessionRecalls = Map<string, Map<string, string | undefined>>
+const RECALLS = Symbol.for("@honcho-ai/opencode-honcho.v2.recall")
+const recallStore = (location: string): SessionRecalls => {
+  const g = globalThis as Record<symbol, Map<string, SessionRecalls> | undefined>
+  const all = (g[RECALLS] ??= new Map())
+  let recalls = all.get(location)
+  if (!recalls) all.set(location, (recalls = new Map()))
+  return recalls
+}
+
 export const setup = async (ctx: PluginContext) => {
   const location = ctx.location.directory
   const generation = nextGeneration(location)
@@ -70,8 +84,9 @@ export const setup = async (ctx: PluginContext) => {
   // request context instead. That context is rebuilt every step, so each recall goes back in right
   // after its own prompt: appending at the tail moved it every step, which broke prompt caching
   // and made claude-agent restart its Claude Code session.
-  // Every prompt is recorded, with undefined when Honcho returned no new recall for it.
-  const pendingRecall = new Map<string, Map<string, string | undefined>>()
+  // Every prompt is recorded, with undefined when Honcho returned no new recall for it. The store
+  // outlives this generation (see recallStore).
+  const pendingRecall = recallStore(location)
 
   const here = ctx.location.directory
   const sessionDirectories = new Map<string, string>()
