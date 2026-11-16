@@ -195,12 +195,15 @@ One `./server` entry serves both OpenCode generations: 1.x calls its `server()` 
 | Purpose | OpenCode 1.x | OpenCode 2.x |
 |---|---|---|
 | Capture the user turn, fetch prompt-specific recall | `chat.message` | `session.hook("prompt")` |
-| Memory instruction + stable snapshot (+ recall on 2.x) | `experimental.chat.system.transform` | `session.hook("context")` |
+| Memory instruction + stable snapshot | `experimental.chat.system.transform` | `session.instructions.entry` (2.2+), else `session.hook("context")` |
+| Prompt-specific recall placement | `chat.message` | `session.hook("context")` |
 | Continuity block during compaction | `experimental.session.compacting` | `session.hook("compaction")` |
 | Record significant tool activity | `tool.execute.after` | `tool.hook("execute.after")` |
 | `HONCHO_*` variables for shell tools | `shell.env` | `shell.hook("create.before")` |
 | `honcho_*` tools | `tool` | `tool.transform` |
 | Session start, assistant capture, cleanup | `event` | `event.subscribe()` (`session.created`, `session.text.ended`, `session.step.ended`, `session.execution.*`, `session.deleted`) |
+
+On OpenCode 2.2 and later, the memory instruction and snapshot go in a session instruction entry, `honcho.memory`, instead of the system prompt. The `prompt` hook puts it once per session, before the first request, so the session starts with it. OpenCode stores the entry with the session, so the snapshot stays the same for the rest of the session, across plugin reloads and server restarts, and the system prompt never changes between steps. An entry removed from outside comes back at the next prompt. A run that starts without a prompt gets the entry from the `context` hook, and it reaches the model from the next step. A snapshot too large for OpenCode's 256 KiB entry limit is cut short. OpenCode 2.0 and 2.1 have no instruction entries, so there the `context` hook adds the instruction and snapshot to the system prompt on every step.
 
 On 2.x, prompt-specific recall is saved in the prompt's message metadata instead of a synthetic message part, because 2.x persists prompt-hook edits as the user's message. The `context` hook reads it back and inserts it right after its prompt on every step, so earlier history never changes, even across plugin reloads and server restarts, and provider prompt caches stay valid. On OpenCode 2.3 and later it reads each request message's stored metadata; older 2.x reads the stored session instead. Recall already shown stays when `recallMode` changes: the mode only decides whether new recall is fetched.
 

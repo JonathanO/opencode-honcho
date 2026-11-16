@@ -121,6 +121,51 @@ describe("OpenCode 2 entrypoints", () => {
     expect(typeof cleanup).toBe("function")
     await cleanup()
   })
+
+  test("on OpenCode 2.2+ the memory goes in one session instruction entry, not the system prompt", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "honcho-v2-"))
+    const configPath = path.join(home, "config.json")
+    await writeFile(configPath, JSON.stringify({ peerName: "wire", baseUrl: "http://127.0.0.1:9", hosts: { opencode: { recallMode: "tools" } } }))
+
+    const { ctx, hooks, find } = fakeContext()
+    ctx.options = { configPath }
+    const stored = new Map()
+    const puts = []
+    ctx.session.instructions = {
+      entry: {
+        list: async ({ sessionID }) => [...stored].filter(([id]) => id.startsWith(`${sessionID}/`)).map(([id, value]) => ({ key: id.split("/")[1], value })),
+        put: async ({ sessionID, key, value }) => {
+          puts.push({ sessionID, key })
+          stored.set(`${sessionID}/${key}`, value)
+        },
+        remove: async () => {},
+      },
+    }
+    const mod = await import("../dist/server.js")
+    const cleanup = await mod.default.setup(ctx)
+
+    // Empty prompts: Honcho skips capturing them, so the test makes no network calls.
+    const prompt = () => ({ sessionID: "ses_entry", messageID: "msg_1", prompt: { text: "" }, delivery: "steer" })
+    await find(hooks.session, "prompt")(prompt())
+    expect(puts).toEqual([{ sessionID: "ses_entry", key: "honcho.memory" }])
+    expect(stored.get("ses_entry/honcho.memory")).toContain("## Honcho Memory")
+
+    const context = { sessionID: "ses_entry", agent: "build", model: { providerID: "anthropic", id: "claude" }, system: [], messages: [], options: {}, tools: {} }
+    await find(hooks.session, "context")(context)
+    await find(hooks.session, "prompt")(prompt())
+    expect(context.system).toEqual([])
+    expect(puts).toHaveLength(1)
+
+    // A reloaded plugin finds the stored entry and leaves it as it is.
+    await cleanup()
+    const reloaded = fakeContext()
+    reloaded.ctx.options = { configPath }
+    reloaded.ctx.session.instructions = ctx.session.instructions
+    const cleanupReloaded = await mod.default.setup(reloaded.ctx)
+    await reloaded.find(reloaded.hooks.session, "context")({ ...context, system: [] })
+    expect(puts).toHaveLength(1)
+    await cleanupReloaded()
+  })
 })
 
 describe("OpenCode 2 cleanup", () => {
@@ -326,5 +371,96 @@ describe("OpenCode 2 recall placement", () => {
       },
       { recallMode: "tools" },
     )
+  })
+})
+
+describe("OpenCode 2 memory entry", () => {
+  const entryStore = () => {
+    const stored = new Map()
+    const puts = []
+    return {
+      stored,
+      puts,
+      api: {
+        entry: {
+          list: async ({ sessionID }) => [...stored].filter(([id]) => id.startsWith(`${sessionID}/`)).map(([id, value]) => ({ key: id.split("/")[1], value })),
+          put: async ({ sessionID, key, value }) => {
+            puts.push({ sessionID, key })
+            stored.set(`${sessionID}/${key}`, value)
+          },
+          remove: async ({ sessionID, key }) => {
+            stored.delete(`${sessionID}/${key}`)
+          },
+        },
+      },
+    }
+  }
+  const setupWith = async (config, instructions) => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "honcho-v2-"))
+    const configPath = path.join(home, "config.json")
+    await writeFile(configPath, JSON.stringify(config))
+    const { ctx, hooks, find } = fakeContext({ directory: home })
+    ctx.options = { configPath }
+    ctx.app.version = "2.3.0"
+    ctx.session.instructions = instructions
+    const mod = await import("../dist/server.js")
+    const cleanup = await mod.default.setup(ctx)
+    return { cleanup, prompt: find(hooks.session, "prompt"), context: find(hooks.session, "context") }
+  }
+  const toolsConfig = { peerName: "wire", baseUrl: "http://127.0.0.1:9", hosts: { opencode: { recallMode: "tools" } } }
+  // Empty prompts: Honcho skips capturing them, so these tests make no network calls.
+  const prompt = (sessionID) => ({ sessionID, messageID: "msg_1", prompt: { text: "" }, delivery: "steer" })
+  const context = (sessionID) => ({ sessionID, agent: "build", model: { providerID: "anthropic", id: "claude" }, system: [], messages: [], options: {}, tools: {} })
+
+  test("a run that starts without a prompt gets the entry from the context hook", async () => {
+    const entries = entryStore()
+    const plugin = await setupWith(toolsConfig, entries.api)
+    const event = context("ses_resumed")
+    await plugin.context(event)
+    // OpenCode read the instructions before this hook, so the entry reaches the model next step.
+    expect(event.system).toEqual([])
+    expect(entries.puts).toEqual([{ sessionID: "ses_resumed", key: "honcho.memory" }])
+    await plugin.context(context("ses_resumed"))
+    expect(entries.puts).toHaveLength(1)
+    await plugin.cleanup()
+  })
+
+  test("an entry removed from outside comes back at the next prompt, not mid-turn", async () => {
+    const entries = entryStore()
+    const plugin = await setupWith(toolsConfig, entries.api)
+    await plugin.prompt(prompt("ses_removed"))
+    await entries.api.entry.remove({ sessionID: "ses_removed", key: "honcho.memory" })
+    await plugin.context(context("ses_removed"))
+    expect(entries.puts).toHaveLength(1)
+    await plugin.prompt(prompt("ses_removed"))
+    expect(entries.puts).toHaveLength(2)
+    expect(entries.stored.get("ses_removed/honcho.memory")).toContain("## Honcho Memory")
+    await plugin.cleanup()
+  })
+
+  test("a snapshot too large for an instruction entry is cut short, keeping the instruction", async () => {
+    const realFetch = globalThis.fetch
+    globalThis.fetch = async (url, init = {}) => {
+      const target = new URL(url)
+      if (/\/peers\/[^/]+\/context$/.test(target.pathname))
+        return Response.json({ peer_id: "wire", target_id: "wire", representation: "fact ".repeat(80_000), peer_card: null })
+      if (/\/sessions\/[^/]+\/context$/.test(target.pathname)) return Response.json({ messages: [], summary: null, peer_representation: null, peer_card: null })
+      if (target.pathname.endsWith("/messages")) return Response.json([])
+      const body = typeof init.body === "string" ? JSON.parse(init.body) : {}
+      return Response.json({ id: body.id, metadata: {}, configuration: {}, created_at: new Date(0).toISOString() })
+    }
+    try {
+      const entries = entryStore()
+      const plugin = await setupWith({ apiKey: "test-key", peerName: "wire", hosts: { opencode: { recallMode: "hybrid" } } }, entries.api)
+      await plugin.prompt(prompt("ses_large"))
+      const value = entries.stored.get("ses_large/honcho.memory")
+      expect(Buffer.byteLength(JSON.stringify(value), "utf8")).toBeLessThanOrEqual(256 * 1024)
+      expect(value).toStartWith("## Honcho Memory")
+      expect(value).toContain("fact fact")
+      expect(value).toEndWith("[Honcho memory snapshot cut short to fit OpenCode's size limit.]")
+      await plugin.cleanup()
+    } finally {
+      globalThis.fetch = realFetch
+    }
   })
 })

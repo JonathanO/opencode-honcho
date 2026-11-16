@@ -12,6 +12,20 @@ type V2Event = ReturnType<PluginContext["event"]["subscribe"]> extends AsyncIter
 export const PLUGIN_ID = "@honcho-ai/opencode-honcho"
 
 const SETTLE_TIMEOUT_MS = 15_000
+const MEMORY_ENTRY = "honcho.memory"
+// OpenCode refuses an instruction entry over 256 KiB of JSON. The memory snapshot has no size limit
+// of its own, so one that would not fit is cut short; the Honcho instruction always stays.
+const MAX_ENTRY_BYTES = 256 * 1024
+const entryValue = (blocks: string[]) => {
+  const bytes = (text: string) => Buffer.byteLength(JSON.stringify(text), "utf8")
+  const whole = blocks.join("\n\n")
+  if (bytes(whole) <= MAX_ENTRY_BYTES) return whole
+  const marker = "\n\n[Honcho memory snapshot cut short to fit OpenCode's size limit.]"
+  let snapshot = blocks.slice(1).join("\n\n")
+  while (snapshot && bytes(`${blocks[0]}\n\n${snapshot}${marker}`) > MAX_ENTRY_BYTES)
+    snapshot = snapshot.slice(0, Math.floor(snapshot.length * 0.9))
+  return `${blocks[0]}\n\n${snapshot}${marker}`
+}
 
 const modelId = (model: ModelRef | undefined) => {
   if (!model || typeof model.id !== "string" || !model.id.trim()) return null
@@ -78,6 +92,33 @@ export const setup = async (ctx: PluginContext) => {
   const core = createHonchoCore(consoleHost(ctx.location.directory, ctx.location.project?.directory), configPath)
   core.setHostVersion(ctx.app.version)
 
+  // On OpenCode 2.2 and later, the Honcho instruction and memory snapshot go in a session
+  // instruction entry rather than the system prompt. OpenCode stores the entry with the session:
+  // put before the session's first request, it is part of the system prompt from the start; put
+  // later, it is announced to the model as an update. Either way the system prompt stays the same
+  // from step to step and across plugin reloads, so prompt caching holds and claude-agent keeps
+  // its Claude Code process. Older 2.x has no entries, so the context hook adds the blocks to the
+  // system prompt instead.
+  const entries = ctx.session.instructions?.entry
+  // Sessions known to have the entry. Every prompt checks again, so an entry removed from outside
+  // comes back at the next prompt, with or without a plugin reload in between; the steps of a turn
+  // trust this set and do not list entries.
+  const attached = new Set<string>()
+  const showMemory = async (sessionID: string, recheck: boolean) => {
+    if (!entries || (!recheck && attached.has(sessionID))) return
+    try {
+      const current = await entries.list({ sessionID })
+      if (!current.some((entry) => entry.key === MEMORY_ENTRY)) {
+        const blocks = await core.systemBlocks({ sessionID })
+        if (blocks.length === 0) return
+        await entries.put({ sessionID, key: MEMORY_ENTRY, value: entryValue(blocks) })
+      }
+      attached.add(sessionID)
+    } catch (error) {
+      await core.log("warn", "Honcho could not attach its memory to the session.", { sessionId: sessionID, error: String(error) })
+    }
+  }
+
   const here = ctx.location.directory
   const sessionDirectories = new Map<string, string>()
   const ownsSession = (event: V2Event, sessionID: string) => {
@@ -101,6 +142,8 @@ export const setup = async (ctx: PluginContext) => {
 
   await ctx.session.hook("prompt", async (event) => {
     sessionDirectories.set(event.sessionID, here)
+    // Before the first request, so a new session starts with the entry in its system prompt.
+    await showMemory(event.sessionID, true)
     const text = typeof event.prompt.text === "string" ? event.prompt.text.trim() : ""
     if (!text) return
     const block = await core.captureUserPrompt(
@@ -118,8 +161,13 @@ export const setup = async (ctx: PluginContext) => {
   })
 
   await ctx.session.hook("context", async (event) => {
+    sessionDirectories.set(event.sessionID, here)
     core.rememberSessionModel(event.sessionID, modelId(event.model))
-    for (const text of await core.systemBlocks({ sessionID: event.sessionID })) event.system.push({ type: "text", text })
+    // A session whose run did not start from a prompt (resumed, or only synthetic input) gets its
+    // entry here. OpenCode has already read the session's instructions for this request, so the
+    // entry first reaches the model on the next step, as an update.
+    if (entries) await showMemory(event.sessionID, false)
+    else for (const text of await core.systemBlocks({ sessionID: event.sessionID })) event.system.push({ type: "text", text })
     // Each recall goes right after the prompt it was retrieved for, read from that prompt's stored
     // metadata. Being stored, it survives plugin reloads and server restarts, moves with a queued
     // prompt, and goes away when a revert or compaction removes its prompt, so earlier history never
@@ -217,6 +265,7 @@ export const setup = async (ctx: PluginContext) => {
         return
       }
       case "session.deleted": {
+        attached.delete(sessionID)
         await core.dropSessionState({ sessionID })
         return
       }
