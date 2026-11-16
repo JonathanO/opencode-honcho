@@ -30,3 +30,20 @@ test("agentObserveMe true turns on self-observation on the root agent peer", () 
 
   expect(topology.sessionPeerConfigs.opencode.observeMe).toBe(true)
 })
+
+test("unified observation turns off the agent's directional view of the user", () => {
+  const topology = __testing.buildPeerTopology({
+    config: { observationMode: "unified" },
+    userPeerId: "user",
+    rootAgentPeerId: "opencode",
+    activeAgentPeerId: "opencode",
+    childAgentPeerId: null,
+    parentAgentObserverPeerId: null,
+  })
+
+  expect(topology.sessionPeerConfigs).toEqual({
+    user: { observeMe: true, observeOthers: false },
+    opencode: { observeMe: false, observeOthers: false },
+  })
+  expect(topology.describedPeers.rootAgentPeer.observeOthers).toBe(false)
+})

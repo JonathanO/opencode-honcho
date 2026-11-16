@@ -977,6 +977,9 @@ const buildPeerTopology = (handle: Pick<
   "config" | "userPeerId" | "rootAgentPeerId" | "activeAgentPeerId" | "childAgentPeerId" | "parentAgentObserverPeerId"
 >): PeerTopology => {
   const agentObserveMe = resolveAgentObserveMe(handle.config)
+  // Unified mode reads only the user's self-collection, so the agent's
+  // directional view of the user would be derived and dreamed but never read.
+  const agentObserveOthers = !isUnifiedObservation(handle.config)
   const userPeer: PeerDescription = {
     id: handle.userPeerId,
     observeMe: true,
@@ -985,12 +988,12 @@ const buildPeerTopology = (handle: Pick<
   const rootAgentPeer: PeerDescription = {
     id: handle.rootAgentPeerId,
     observeMe: agentObserveMe,
-    observeOthers: true,
+    observeOthers: agentObserveOthers,
   }
   return {
     sessionPeerConfigs: {
       [userPeer.id]: { observeMe: true, observeOthers: false },
-      [rootAgentPeer.id]: { observeMe: agentObserveMe, observeOthers: true },
+      [rootAgentPeer.id]: { observeMe: agentObserveMe, observeOthers: agentObserveOthers },
     },
     describedPeers: {
       userPeer,

@@ -275,6 +275,7 @@ const importConfigFromSettings = (settings: GlobalSettings) => {
     agentPeerId,
     sessionStrategy: host.sessionStrategy || DEFAULT_SETTINGS.sessionStrategy,
     agentObserveMe: host.agentObserveMe === true,
+    agentObserveOthers: host.observationMode !== "unified",
   }
 }
 
@@ -525,6 +526,7 @@ export const runImport = async (session: TuiSession) => {
       honcho,
       userPeerId: config.userPeerId,
       agentObserveMe: config.agentObserveMe,
+      agentObserveOthers: config.agentObserveOthers,
     })
     await session.dialogs.alert({
       title: "Honcho import",

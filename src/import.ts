@@ -360,6 +360,8 @@ export type ExecuteImportOptions = PlanImportOptions & {
   honcho: Honcho
   userPeerId: string
   agentObserveMe: boolean
+  /** Whether the agent peer builds its own view of the user; off in unified mode. Defaults to true. */
+  agentObserveOthers?: boolean
   statePath?: string
 }
 
@@ -382,7 +384,10 @@ export const executeOpenCodeImport = async (options: ExecuteImportOptions): Prom
       const session = await options.honcho.session(sessionPlan.honchoSessionKey)
       await session.addPeers([
         [options.userPeerId, { observeMe: true, observeOthers: false }],
-        [options.agentPeerId, { observeMe: options.agentObserveMe === true, observeOthers: true }],
+        [
+          options.agentPeerId,
+          { observeMe: options.agentObserveMe === true, observeOthers: options.agentObserveOthers !== false },
+        ],
       ] as never)
       const payload = sessionPlan.messages.map((message) => {
         const peer = message.role === "user" ? userPeer : agentPeer
