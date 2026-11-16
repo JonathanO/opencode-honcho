@@ -12,6 +12,7 @@ type V2Event = ReturnType<PluginContext["event"]["subscribe"]> extends AsyncIter
 export const PLUGIN_ID = "@honcho-ai/opencode-honcho"
 
 const SETTLE_TIMEOUT_MS = 15_000
+const MEMORY_ENTRY = "honcho.memory"
 
 const modelId = (model: ModelRef | undefined) => {
   if (!model || typeof model.id !== "string" || !model.id.trim()) return null
@@ -69,6 +70,31 @@ export const setup = async (ctx: PluginContext) => {
   // prompt hook's edits become the persisted user text, so it rides in the request context instead.
   const pendingRecall = new Map<string, string>()
 
+  // On OpenCode 2.2 and later, the Honcho instruction and memory snapshot go in a session
+  // instruction entry rather than the system prompt. OpenCode stores the entry with the session:
+  // put before the session's first request, it is part of the system prompt from the start; put
+  // later, it is announced to the model as an update. Either way the system prompt stays the same
+  // from step to step and across plugin reloads, so prompt caching holds and claude-agent keeps
+  // its Claude Code process. Older 2.x has no entries, so the context hook adds the blocks to the
+  // system prompt instead.
+  const entries = ctx.session.instructions?.entry
+  // Sessions known to have the entry, so a step does not list entries again.
+  const shown = new Set<string>()
+  const showMemory = async (sessionID: string) => {
+    if (!entries || shown.has(sessionID)) return
+    try {
+      const current = await entries.list({ sessionID })
+      if (!current.some((entry) => entry.key === MEMORY_ENTRY)) {
+        const blocks = await core.systemBlocks({ sessionID })
+        if (blocks.length === 0) return
+        await entries.put({ sessionID, key: MEMORY_ENTRY, value: blocks.join("\n\n") })
+      }
+      shown.add(sessionID)
+    } catch (error) {
+      await core.log("warn", "Honcho could not attach its memory to the session.", { sessionId: sessionID, error: String(error) })
+    }
+  }
+
   const here = ctx.location.directory
   const sessionDirectories = new Map<string, string>()
   const ownsSession = (event: V2Event, sessionID: string) => {
@@ -79,6 +105,8 @@ export const setup = async (ctx: PluginContext) => {
 
   await ctx.session.hook("prompt", async (event) => {
     sessionDirectories.set(event.sessionID, here)
+    // Before the first request, so a new session starts with the entry in its system prompt.
+    await showMemory(event.sessionID)
     const text = typeof event.prompt.text === "string" ? event.prompt.text.trim() : ""
     if (!text) return
     const block = await core.captureUserPrompt(
@@ -93,9 +121,8 @@ export const setup = async (ctx: PluginContext) => {
 
   await ctx.session.hook("context", async (event) => {
     core.rememberSessionModel(event.sessionID, modelId(event.model))
-    const blocks = await core.systemBlocks({ sessionID: event.sessionID })
-    if (blocks.length === 0) return
-    for (const text of blocks) event.system.push({ type: "text", text })
+    if (entries) await showMemory(event.sessionID)
+    else for (const text of await core.systemBlocks({ sessionID: event.sessionID })) event.system.push({ type: "text", text })
     const recall = pendingRecall.get(event.sessionID)
     if (recall) event.messages.push({ role: "user", content: [{ type: "text", text: recall }] })
   })
@@ -181,6 +208,7 @@ export const setup = async (ctx: PluginContext) => {
       }
       case "session.deleted": {
         pendingRecall.delete(sessionID)
+        shown.delete(sessionID)
         await core.dropSessionState({ sessionID })
         return
       }

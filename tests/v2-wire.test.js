@@ -120,6 +120,51 @@ describe("OpenCode 2 entrypoints", () => {
     expect(typeof cleanup).toBe("function")
     await cleanup()
   })
+
+  test("on OpenCode 2.2+ the memory goes in one session instruction entry, not the system prompt", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "honcho-v2-"))
+    const configPath = path.join(home, "config.json")
+    await writeFile(configPath, JSON.stringify({ peerName: "wire", baseUrl: "http://127.0.0.1:9", hosts: { opencode: { recallMode: "tools" } } }))
+
+    const { ctx, hooks, find } = fakeContext()
+    ctx.options = { configPath }
+    const stored = new Map()
+    const puts = []
+    ctx.session.instructions = {
+      entry: {
+        list: async ({ sessionID }) => [...stored].filter(([id]) => id.startsWith(`${sessionID}/`)).map(([id, value]) => ({ key: id.split("/")[1], value })),
+        put: async ({ sessionID, key, value }) => {
+          puts.push({ sessionID, key })
+          stored.set(`${sessionID}/${key}`, value)
+        },
+        remove: async () => {},
+      },
+    }
+    const mod = await import("../dist/server.js")
+    const cleanup = await mod.default.setup(ctx)
+
+    // Empty prompts: Honcho skips capturing them, so the test makes no network calls.
+    const prompt = () => ({ sessionID: "ses_entry", messageID: "msg_1", prompt: { text: "" }, delivery: "steer" })
+    await find(hooks.session, "prompt")(prompt())
+    expect(puts).toEqual([{ sessionID: "ses_entry", key: "honcho.memory" }])
+    expect(stored.get("ses_entry/honcho.memory")).toContain("## Honcho Memory")
+
+    const context = { sessionID: "ses_entry", agent: "build", model: { providerID: "anthropic", id: "claude" }, system: [], messages: [], options: {}, tools: {} }
+    await find(hooks.session, "context")(context)
+    await find(hooks.session, "prompt")(prompt())
+    expect(context.system).toEqual([])
+    expect(puts).toHaveLength(1)
+
+    // A reloaded plugin finds the stored entry and leaves it as it is.
+    await cleanup()
+    const reloaded = fakeContext()
+    reloaded.ctx.options = { configPath }
+    reloaded.ctx.session.instructions = ctx.session.instructions
+    const cleanupReloaded = await mod.default.setup(reloaded.ctx)
+    await reloaded.find(reloaded.hooks.session, "context")({ ...context, system: [] })
+    expect(puts).toHaveLength(1)
+    await cleanupReloaded()
+  })
 })
 
 describe("OpenCode 2 cleanup", () => {
